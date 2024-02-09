@@ -492,6 +492,27 @@ walprop_pg_init_standalone_sync_safekeepers(void)
 	BackgroundWorkerUnblockSignals();
 }
 
+/* Flag set by signal handlers for later service in main loop */
+static volatile sig_atomic_t got_SIGUSR2 = false;
+
+/*
+ * We pretend to be a walsender process, and the lifecycle of a walsender is
+ * slightly different than other procesess. At shutdown, walsender processes
+ * stay alive until the very end, after the checkpointer has written the
+ * shutdown checkpoint. When the checkpointer exits, the postmaster sends all
+ * remaining walsender processes SIGUSR2. On receiving SIGUSR2, we try to send
+ * the remaining WAL, and then exit. This ensures that the checkpoint record
+ * reaches durable storage (in safekeepers), before the server shuts down
+ * completely.
+ */
+static void
+walprop_sigusr2(SIGNAL_ARGS)
+{
+	got_SIGUSR2 = true;
+
+	SetLatch(MyLatch);
+}
+
 static void
 walprop_pg_init_bgworker(void)
 {
@@ -503,6 +524,7 @@ walprop_pg_init_bgworker(void)
 	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
+	pqsignal(SIGUSR2, walprop_sigusr2);
 
 	BackgroundWorkerUnblockSignals();
 
@@ -1122,6 +1144,9 @@ StartProposerReplication(WalProposer *wp, StartReplicationCmd *cmd)
 static void
 WalSndLoop(WalProposer *wp)
 {
+	bool		reported_sigusr2 = false;
+	XLogRecPtr	flushPtr;
+
 	/* Clear any already-pending wakeups */
 	ResetLatch(MyLatch);
 
@@ -1129,10 +1154,51 @@ WalSndLoop(WalProposer *wp)
 	{
 		CHECK_FOR_INTERRUPTS();
 
+		if (got_SIGUSR2 && !reported_sigusr2)
+		{
+			flushPtr = walprop_pg_get_flush_rec_ptr(wp);
+
+			if (quorumFeedback.flushLsn != flushPtr)
+				elog(LOG, "wal proposer will send and wait for remaining WAL between %X/%X and %X/%X",
+					 LSN_FORMAT_ARGS(quorumFeedback.flushLsn), LSN_FORMAT_ARGS(flushPtr));
+		}
+
 		XLogBroadcastWalProposer(wp);
 
+		if (got_SIGUSR2)
+		{
+			flushPtr = walprop_pg_get_flush_rec_ptr(wp);
+			if (quorumFeedback.flushLsn == flushPtr)
+			{
+				elog(LOG, "Wal proposer sent all WAL up to %X/%X, exiting",
+					 LSN_FORMAT_ARGS(sentPtr));
+				proc_exit(0);
+			}
+		}
+
+		/*
+		 * XXX: Move straight to STOPPING state, skipping the STREAMING state.
+		 *
+		 * This is a bit weird. Normal walsenders stay in STREAMING state,
+		 * until the checkpointer signals them that it is about to start
+		 * writing the shutdown checkpoint. The walsenders acknowledge that
+		 * they have received that signal by switching to STOPPING state.
+		 * That tells the walsenders that they must not write any new WAL.
+		 *
+		 * However, we cannot easily intercept that signal from the
+		 * checkpointer.  It's sent by WalSndInitStopping(), using
+		 * SendProcSignal(PROCSIGNAL_WALSND_INIT_STOPPING). It's received by
+		 * HandleWalSndInitStopping, which sets a process-local got_STOPPING
+		 * flag. However, that's all private to walsender.c.
+		 *
+		 * We don't need to do anything special upon receiving the signal, the
+		 * walproposer doesn't write any WAL anyway, so we skip the STREAMING
+		 * state and go directly to STOPPING mode. That way, the checkpointer
+		 * won't wait for us.
+		 */
 		if (MyWalSnd->state == WALSNDSTATE_CATCHUP)
-			WalSndSetState(WALSNDSTATE_STREAMING);
+			WalSndSetState(WALSNDSTATE_STOPPING);
+
 		WalProposerPoll(wp);
 	}
 }
